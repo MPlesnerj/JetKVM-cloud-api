@@ -1,22 +1,43 @@
-import { generators, Issuer } from "openid-client";
+import { BaseClient, generators, Issuer } from "openid-client";
 import express from "express";
 import { prisma } from "./db";
 import { BadRequestError, UnauthorizedError } from "./errors";
-import { isIdentityAllowed } from "./auth";
+import {
+  checkProviderClaims,
+  identityEmail,
+  isCustomOidc,
+  isIdentityAllowed,
+  oidcClientId,
+  oidcClientSecret,
+  oidcIssuer,
+} from "./auth";
 import * as crypto from "crypto";
 
 const API_HOSTNAME = process.env.API_HOSTNAME;
 const APP_HOSTNAME = process.env.APP_HOSTNAME;
-const REDIRECT_URI = `${API_HOSTNAME}/oidc/callback`;
+const REDIRECT_URI = process.env.OIDC_REDIRECT_URI || `${API_HOSTNAME}/oidc/callback`;
 
-const getGoogleOIDCClient = async () => {
-  const googleIssuer = await Issuer.discover("https://accounts.google.com");
-  return new googleIssuer.Client({
-    client_id: process.env.GOOGLE_CLIENT_ID,
-    client_secret: process.env.GOOGLE_CLIENT_SECRET,
-    redirect_uris: [REDIRECT_URI],
-    response_types: ["code"],
-  });
+// Google upstream; Entra ID (or another OIDC provider) when OIDC_ISSUER is set — see auth.ts.
+// The provider's discovery document is fetched once per process instead of on every login.
+let clientPromise: Promise<BaseClient> | null = null;
+const getGoogleOIDCClient = (): Promise<BaseClient> => {
+  if (!clientPromise) {
+    clientPromise = Issuer.discover(oidcIssuer())
+      .then(
+        (issuer) =>
+          new issuer.Client({
+            client_id: oidcClientId(),
+            client_secret: oidcClientSecret(),
+            redirect_uris: [REDIRECT_URI],
+            response_types: ["code"],
+          }),
+      )
+      .catch((err) => {
+        clientPromise = null; // try discovery again on the next login
+        throw err;
+      });
+  }
+  return clientPromise;
 };
 
 export const Google = async (req: express.Request, res: express.Response) => {
@@ -42,6 +63,8 @@ export const Google = async (req: express.Request, res: express.Response) => {
     // which is stored in the session cookie.
     code_challenge,
     code_challenge_method: "S256",
+    // Entra: always show the account picker (users often have several work accounts)
+    ...(isCustomOidc() ? { prompt: "select_account" } : {}),
   });
   return res.redirect(authorizationUrl);
 };
@@ -53,6 +76,15 @@ export const Callback = async (req: express.Request, res: express.Response) => {
   const params = client.callbackParams(req);
   if (!params)
     throw new BadRequestError("Missing callback parameters", "missing_callback_params");
+
+  // The provider reports refused sign-ins (e.g. user not assigned to the Entra app) as error params.
+  if (params.error) {
+    console.warn("Sign-in refused by the identity provider:", params.error, params.error_description);
+    throw new UnauthorizedError(
+      params.error_description || "Sign-in was not completed",
+      params.error === "access_denied" ? "account_not_allowed" : "sign_in_failed",
+    );
+  }
 
   const sessionCsrf = req.session?.csrf;
   if (!sessionCsrf) {
@@ -77,8 +109,6 @@ export const Callback = async (req: express.Request, res: express.Response) => {
     code_verifier: req.session?.code_verifier,
   });
 
-  const userInfo = await client.userinfo(tokenSet);
-
   // TokenClaims is an object that contains the sub, email, name and other claims
   const tokenClaims = tokenSet.claims();
   if (!tokenClaims) {
@@ -87,6 +117,19 @@ export const Callback = async (req: express.Request, res: express.Response) => {
 
   if (!tokenSet.id_token) {
     throw new BadRequestError("Missing ID Token", "missing_id_token");
+  }
+
+  // Google: e-mail and picture come from the userinfo endpoint.
+  // Entra: everything needed is in the ID token (its userinfo endpoint lives on Microsoft Graph).
+  const userInfo = isCustomOidc()
+    ? { email: identityEmail(tokenClaims), picture: undefined as string | undefined }
+    : await client.userinfo(tokenSet);
+
+  const claimError = checkProviderClaims(tokenClaims);
+  if (claimError) {
+    req.session = null;
+    console.warn("Sign-in rejected:", claimError, "sub", tokenClaims.sub);
+    throw new UnauthorizedError("Account is not authorized for this portal", claimError);
   }
 
   if (!userInfo.email) {
@@ -161,9 +204,19 @@ export const Callback = async (req: express.Request, res: express.Response) => {
     const url = new URL(returnTo);
     url.searchParams.append("tempToken", tempToken);
     url.searchParams.append("deviceId", deviceId);
+    // The device verifies this ID token itself. The parameter names stay as upstream so the
+    // device UI forwards them unchanged; patched firmware learns the issuer from GET /oidc/config.
     url.searchParams.append("oidcGoogle", tokenSet.id_token.toString());
-    url.searchParams.append("clientId", process.env.GOOGLE_CLIENT_ID);
+    url.searchParams.append("clientId", oidcClientId());
     return res.redirect(url.toString());
   }
   return res.redirect(returnTo);
+};
+
+/**
+ * GET /oidc/config — which identity provider this cloud uses. Public, no secrets.
+ * Patched device firmware reads it when it is adopted, so it can verify tokens from Entra ID.
+ */
+export const Config = async (req: express.Request, res: express.Response) => {
+  return res.json({ issuer: oidcIssuer(), clientId: oidcClientId() });
 };

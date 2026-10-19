@@ -8,7 +8,7 @@ import {
   UnprocessableEntityError,
 } from "./errors";
 import * as crypto from "crypto";
-import { authenticated } from "./auth";
+import { authenticated, isTrustedIssuer } from "./auth";
 import { activeConnections } from "./webrtc-signaling";
 import { effectiveSku } from "./skus";
 
@@ -31,9 +31,8 @@ export const List = async (req: express.Request, res: express.Response) => {
   const idToken = req.session?.id_token;
   const { iss, sub } = jose.decodeJwt(idToken);
 
-  // Authorization server’s identifier for the user
-  const isGoogle = iss === "https://accounts.google.com";
-  if (isGoogle) {
+  // Authorization server’s identifier for the user (Google upstream, Entra ID when OIDC_ISSUER is set)
+  if (isTrustedIssuer(iss)) {
     const devices = await prisma.device.findMany({
       where: { user: { googleId: sub } },
       select: { id: true, name: true, lastSeen: true },
@@ -46,7 +45,7 @@ export const List = async (req: express.Request, res: express.Response) => {
       })),
     });
   } else {
-    throw new BadRequestError("Token is not from Google");
+    throw new BadRequestError("Token is not from the configured identity provider");
   }
 };
 

@@ -20,15 +20,83 @@ export const isIdentityAllowed = (identity?: string | null) => {
   return allowedIdentities.has(identityNormalized);
 };
 
-export const verifyToken = async (idToken: string) => {
-  const JWKS = jose.createRemoteJWKSet(
-    new URL("https://www.googleapis.com/oauth2/v3/certs"),
-  );
+/**
+ * Identity provider.
+ *
+ * Upstream signs users in with Google. When OIDC_ISSUER is set (e.g.
+ * https://login.microsoftonline.com/<tenant>/v2.0) the API uses that OpenID Connect
+ * provider instead — Microsoft Entra ID in the branded deployment. Without
+ * OIDC_ISSUER everything behaves exactly as upstream.
+ */
+export const GOOGLE_ISSUER = "https://accounts.google.com";
 
+export const isCustomOidc = () => !!process.env.OIDC_ISSUER;
+export const oidcIssuer = () => process.env.OIDC_ISSUER || GOOGLE_ISSUER;
+export const oidcClientId = () =>
+  (isCustomOidc() ? process.env.OIDC_CLIENT_ID : process.env.GOOGLE_CLIENT_ID) as string;
+export const oidcClientSecret = () =>
+  (isCustomOidc() ? process.env.OIDC_CLIENT_SECRET : process.env.GOOGLE_CLIENT_SECRET) as string;
+
+/** True when a token was issued by the identity provider this API uses. */
+export const isTrustedIssuer = (iss?: string | null) => !!iss && iss === oidcIssuer();
+
+/** Signing keys of the provider: Google's certs, Entra's v2.0 keys, or OIDC_JWKS_URI. */
+export const jwksUriFor = (issuer: string) => {
+  if (process.env.OIDC_JWKS_URI) return process.env.OIDC_JWKS_URI;
+  if (issuer === GOOGLE_ISSUER) return "https://www.googleapis.com/oauth2/v3/certs";
+  // https://login.microsoftonline.com/<tenant>/v2.0 -> .../<tenant>/discovery/v2.0/keys
+  return issuer.replace(/\/v2\.0\/?$/, "") + "/discovery/v2.0/keys";
+};
+
+// One key set per issuer for the life of the process (jose caches and refreshes the keys).
+const jwksCache = new Map<string, ReturnType<typeof jose.createRemoteJWKSet>>();
+const jwksFor = (issuer: string) => {
+  let jwks = jwksCache.get(issuer);
+  if (!jwks) {
+    jwks = jose.createRemoteJWKSet(new URL(jwksUriFor(issuer)));
+    jwksCache.set(issuer, jwks);
+  }
+  return jwks;
+};
+
+/** App roles that may use the portal (Entra only). Override with OIDC_ALLOWED_ROLES="A,B". */
+export const allowedRoles = () =>
+  (process.env.OIDC_ALLOWED_ROLES ?? "KVM.ProviderAdmin,KVM.Operator,KVM.Viewer")
+    .split(",")
+    .map((r) => r.trim())
+    .filter(Boolean);
+
+/** E-mail used for ALLOWED_IDENTITIES: Google sends `email`; Entra often only `preferred_username`. */
+export const identityEmail = (claims: Record<string, unknown>) => {
+  for (const key of ["email", "preferred_username", "upn"]) {
+    const value = claims[key];
+    if (typeof value === "string" && value.includes("@")) return value;
+  }
+  return undefined;
+};
+
+/**
+ * Extra checks for a custom (Entra) provider: the token must come from our tenant and carry
+ * one of the KVM app roles. Returns an error code, or null when the claims are acceptable.
+ */
+export const checkProviderClaims = (claims: Record<string, unknown>): string | null => {
+  if (!isCustomOidc()) return null;
+  const tenant = process.env.OIDC_TENANT_ID;
+  if (tenant && claims.tid !== tenant) return "wrong_tenant";
+  const roles = Array.isArray(claims.roles) ? (claims.roles as unknown[]) : [];
+  const allowed = allowedRoles();
+  if (allowed.length > 0 && !roles.some((r) => typeof r === "string" && allowed.includes(r))) {
+    return "missing_app_role";
+  }
+  return null;
+};
+
+export const verifyToken = async (idToken: string) => {
+  const issuer = oidcIssuer();
   try {
-    const { payload } = await jose.jwtVerify(idToken, JWKS, {
-      issuer: "https://accounts.google.com",
-      audience: process.env.GOOGLE_CLIENT_ID,
+    const { payload } = await jose.jwtVerify(idToken, jwksFor(issuer), {
+      issuer,
+      audience: oidcClientId(),
     });
 
     return payload;
@@ -50,7 +118,10 @@ export const authenticated = async (req: Request, res: Response, next: NextFunct
     throw new UnauthorizedError();
   }
 
-  const email = (payload as { email?: string }).email;
+  const claimError = checkProviderClaims(payload);
+  if (claimError) throw new UnauthorizedError("Account is not authorized for this portal", claimError);
+
+  const email = identityEmail(payload);
   if (!isIdentityAllowed(email)) {
     throw new UnauthorizedError("Account is not in the allowlist", "account_not_allowed");
   }

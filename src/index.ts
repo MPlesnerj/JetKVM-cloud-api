@@ -11,7 +11,7 @@ import * as Webrtc from "./webrtc";
 import * as Releases from "./releases";
 
 import { HttpError } from "./errors";
-import { authenticated, bearerToken } from "./auth";
+import { authenticated, bearerToken, isTrustedIssuer } from "./auth";
 import { prisma } from "./db";
 import { baseUrl, bucketName, s3Client } from "./s3";
 import { createReleaseSyncRunner, scheduleReleaseSync } from "./release-sync";
@@ -27,9 +27,18 @@ declare global {
       APP_HOSTNAME: string;
       COOKIE_SECRET: string;
 
-      // We use Google OIDC for authentication
+      // We use Google OIDC for authentication…
       GOOGLE_CLIENT_ID: string;
       GOOGLE_CLIENT_SECRET: string;
+
+      // …or another OpenID Connect provider (Microsoft Entra ID) when OIDC_ISSUER is set
+      OIDC_ISSUER?: string;
+      OIDC_TENANT_ID?: string;
+      OIDC_CLIENT_ID?: string;
+      OIDC_CLIENT_SECRET?: string;
+      OIDC_REDIRECT_URI?: string;
+      OIDC_JWKS_URI?: string;
+      OIDC_ALLOWED_ROLES?: string;
 
       // We use Cloudflare STUN & TURN server for cloud users
       CLOUDFLARE_TURN_ID: string;
@@ -106,7 +115,7 @@ app.get(
     const { sub, iss, exp, aud, iat, jti, nbf } = jose.decodeJwt(idToken);
 
     let user;
-    if (iss === "https://accounts.google.com") {
+    if (isTrustedIssuer(iss)) {
       user = await prisma.user.findUnique({
         where: { googleId: sub },
         select: { picture: true, email: true },
@@ -150,6 +159,7 @@ app.post(
 );
 
 app.post("/oidc/google", OIDC.Google);
+app.get("/oidc/config", OIDC.Config);
 app.get("/oidc/callback_o", OIDC.Callback);
 app.get("/oidc/callback", (req, res) => {
   /*
