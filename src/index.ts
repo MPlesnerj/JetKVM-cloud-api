@@ -40,9 +40,13 @@ declare global {
       OIDC_JWKS_URI?: string;
       OIDC_ALLOWED_ROLES?: string;
 
-      // We use Cloudflare STUN & TURN server for cloud users
+      // We use Cloudflare STUN & TURN server for cloud users…
       CLOUDFLARE_TURN_ID: string;
       CLOUDFLARE_TURN_TOKEN: string;
+
+      // …or a self-hosted coturn with use-auth-secret (takes precedence when both are set)
+      TURN_URLS?: string;
+      TURN_SHARED_SECRET?: string;
 
       // We use R2 for storing releases
       R2_ENDPOINT: string;
