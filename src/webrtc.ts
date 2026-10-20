@@ -1,5 +1,6 @@
 import { WebSocket, WebSocketServer } from "ws";
 import express from "express";
+import { createHmac } from "crypto";
 import * as jose from "jose";
 import { prisma } from "./db";
 import { NotFoundError, UnauthorizedError, UnprocessableEntityError } from "./errors";
@@ -97,6 +98,26 @@ export const CreateSession = async (req: express.Request, res: express.Response)
   }
 };
 
+/**
+ * Short-lived credentials for a self-hosted coturn server running with `use-auth-secret`
+ * (the "TURN REST API" scheme): username = "<expiry unix time>:<user id>",
+ * credential = base64(HMAC-SHA1(shared secret, username)). coturn checks both itself, so
+ * the shared secret never leaves the API. Returns null when TURN_URLS / TURN_SHARED_SECRET
+ * are not set, so Cloudflare (CLOUDFLARE_TURN_ID / CLOUDFLARE_TURN_TOKEN) is used as before.
+ */
+export const coturnIceServers = (userId: string, ttlSeconds = 3600) => {
+  const urls = (process.env.TURN_URLS || "")
+    .split(",")
+    .map(url => url.trim())
+    .filter(url => /^(turn|turns|stun):/.test(url));
+  const secret = process.env.TURN_SHARED_SECRET;
+  if (!secret || !urls.some(url => url.startsWith("turn"))) return null;
+
+  const username = `${Math.floor(Date.now() / 1000) + ttlSeconds}:${userId}`;
+  const credential = createHmac("sha1", secret).update(username).digest("base64");
+  return { urls, username, credential };
+};
+
 export const CreateIceCredentials = async (
   req: express.Request,
   res: express.Response,
@@ -109,6 +130,12 @@ export const CreateIceCredentials = async (
     select: { id: true },
   });
   if (!user) throw new UnauthorizedError();
+
+  // Self-hosted coturn (e.g. the TURN VM in Azure) takes precedence over Cloudflare.
+  const coturn = coturnIceServers(user.id.toString());
+  if (coturn) {
+    return res.json({ iceServers: coturn });
+  }
 
   const resp = await fetch(
     `https://rtc.live.cloudflare.com/v1/turn/keys/${process.env.CLOUDFLARE_TURN_ID}/credentials/generate`,
